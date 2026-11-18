@@ -134,12 +134,12 @@ class DataEngine:
                 "SELECT MAX(date) FROM stock_daily WHERE symbol = ?",
                 (symbol,),
             ).fetchone()
-        return row if row and row else None
+        return row[0] if row and row[0] else None
 
     def _get_backfilled_symbols(self) -> set[str]:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute("SELECT symbol FROM backfill_progress").fetchall()
-        return {row for row in rows}
+        return {row[0] for row in rows if row and row[0]}
 
     def _mark_backfill_complete(self, symbol: str, rows_saved: int) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -267,7 +267,9 @@ class DataEngine:
         pending = [s for s in symbols if s not in completed]
         total = len(symbols)
 
-        logger.info(f"历史回填状态 | 总数 {total} | 已完成 {len(completed)} | 待处理 {len(pending)}")
+        logger.info(
+            f"历史回填状态 | 总数 {total} | 已完成 {len(completed)} | 待处理 {len(pending)}"
+        )
         if not pending:
             logger.info("全部股票历史回填已经完成！")
             return
@@ -311,97 +313,122 @@ class DataEngine:
 
                 bs_code = self._to_baostock_code(symbol)
                 rows = []
+                query_ok = False
+                last_error = ""
 
+                for attempt in range(max_retries):
+                    try:
+                        rs = bs.query_history_k_data_plus(
+                            bs_code,
+                            _BAOSTOCK_FIELDS,
+                            start_date=self.start_date,
+                            end_date=today_str,
+                            frequency="d",
+                            adjustflag="1",
+                        )
+                        if rs.error_code != "0":
+                            raise RuntimeError(rs.error_msg)
+                        rows = []
+                        while rs.next():
+                            rows.append(rs.get_row_data())
+                        query_ok = True
+                        break
+                    except Exception as exc:
+                        last_error = str(exc)
+                        logger.warning(f"[{symbol}] 第 {attempt + 1} 次失败：{exc}")
+                        if attempt < max_retries - 1:
+                            wait = 2 ** (attempt + 1)
+                            logger.info(f"等待 {wait} 秒后重新连接")
+                            time.sleep(wait)
+                            login()
+                            since_reconnect += 1
 
-query_ok = False
-last_error = ""
-for attempt in range(max_retries):
-try:
-rs = bs.query_history_k_data_plus(
-bs_code,
-_BAOSTOCK_FIELDS,
-start_date=self.start_date,
-end_date=today_str,
-frequency="d",
-adjustflag="1",
-)
-if rs.error_code != "0":
-raise RuntimeError(rs.error_msg)
-rows = []
-while rs.next():
-rows.append(rs.get_row_data())
-query_ok = True
-break
-except Exception as exc:
-last_error = str(exc)
-logger.warning(f"[{symbol}] 第 {attempt + 1} 次失败：{exc}")
-if attempt < max_retries - 1:
-wait = 2 ** (attempt + 1)
-logger.info(f"等待 {wait} 秒后重新连接")
-time.sleep(wait)
-login()
-since_reconnect += 1
-if not query_ok:
-failed += 1
-consecutive_failures += 1
-logger.error(f"[{symbol}] 失败（连续 {consecutive_failures} 只）：{last_error}")
-if consecutive_failures >= max_consecutive_failures:
-raise RuntimeError("连续 20 只股票查询失败，疑似接口异常，停止本批次")
-continue
-consecutive_failures = 0
-try:
-df = self._prepare_dataframe(rows, symbol)
-saved = self._save_dataframe(df)
-self._mark_backfill_complete(symbol, saved)
-if saved > 0:
-success += 1
-else:
-skipped += 1
-except Exception as exc:
-failed += 1
-logger.exception(f"[{symbol}] 写入数据库失败：{exc}")
-continue
-if i % 25 == 0 or i == len(batch):
-logger.info(
-f"本批进度 {i}/{len(batch)} | 成功 {success} | 跳过 {skipped} | 失败 {failed}"
-)
-time.sleep(0.2)
-finally:
-try:
-bs.logout()
-except Exception:
-pass
-completed_after = self._get_backfilled_symbols()
-logger.info(
-f"本批结束 | 总进度 {len(completed_after)}/{total} | 剩余 {max(0, total - len(completed_after))}"
-)
-def get_all_symbols(self) -> list[str]:
-import baostock as bs
-try:
-lg = bs.login()
-if lg.error_code != "0":
-return []
-rs = bs.query_stock_basic(code_name="", code="")
-if rs.error_code != "0":
-return []
-symbols = []
-while rs.next():
-row = rs.get_row_data()
-if row == "1" and row == "1":
-symbols.append(row.split("."))
-logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
-return symbols
-except Exception as exc:
-logger.exception(f"获取股票列表异常：{exc}")
-return []
-finally:
-try:
-bs.logout()
-except Exception:
-pass
-def get_local_symbols(self) -> list[str]:
-with sqlite3.connect(self.db_path) as conn:
-rows = conn.execute(
-"SELECT DISTINCT symbol FROM stock_daily ORDER BY symbol"
-).fetchall()
-return [row for row in rows]
+                if not query_ok:
+                    failed += 1
+                    consecutive_failures += 1
+                    logger.error(
+                        f"[{symbol}] 失败（连续 {consecutive_failures} 只）：{last_error}"
+                    )
+                    if consecutive_failures >= max_consecutive_failures:
+                        raise RuntimeError(
+                            "连续 20 只股票查询失败，疑似接口异常，停止本批次"
+                        )
+                    continue
+
+                consecutive_failures = 0
+                try:
+                    df = self._prepare_dataframe(rows, symbol)
+                    saved = self._save_dataframe(df)
+                    self._mark_backfill_complete(symbol, saved)
+                    if saved > 0:
+                        success += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.exception(f"[{symbol}] 写入数据库失败：{exc}")
+                    continue
+
+                if i % 25 == 0 or i == len(batch):
+                    logger.info(
+                        f"本批进度 {i}/{len(batch)} | 成功 {success} | 跳过 {skipped} | 失败 {failed}"
+                    )
+                time.sleep(0.2)
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+        completed_after = self._get_backfilled_symbols()
+        logger.info(
+            f"本批结束 | 总进度 {len(completed_after)}/{total} | 剩余 {max(0, total - len(completed_after))}"
+        )
+
+    def get_all_symbols(self) -> list[str]:
+        import baostock as bs
+
+        try:
+            lg = bs.login()
+            if lg.error_code != "0":
+                return []
+            rs = bs.query_stock_basic(code_name="", code="")
+            if rs.error_code != "0":
+                return []
+
+            fields = rs.fields or []
+            code_idx = fields.index("code") if "code" in fields else 0
+            type_idx = fields.index("type") if "type" in fields else 2
+            status_idx = fields.index("status") if "status" in fields else 4
+
+            symbols = []
+            while rs.next():
+                row = rs.get_row_data()
+                if len(row) <= max(code_idx, type_idx, status_idx):
+                    continue
+                code_str = row[code_idx]
+                stock_type = row[type_idx]
+                status = row[status_idx]
+                if stock_type == "1" and status == "1" and "." in code_str:
+                    _, pure_code = code_str.split(".", 1)
+                    if pure_code.startswith(("0", "3", "6")):
+                        symbols.append(pure_code)
+
+            symbols = list(dict.fromkeys(symbols))
+            logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
+            return symbols
+        except Exception as exc:
+            logger.exception(f"获取股票列表异常：{exc}")
+            return []
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
+    def get_local_symbols(self) -> list[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM stock_daily ORDER BY symbol"
+            ).fetchall()
+        return [row[0] for row in rows if row and row[0]]
