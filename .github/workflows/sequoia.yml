@@ -1,0 +1,82 @@
+
+name: Sequoia-X Stock Selection
+
+on:
+  # 每个工作日北京时间 19:30
+  schedule:
+    - cron: "30 11 * * 1-5"
+
+  # 支持手动执行
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - backfill
+          - daily
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sequoia-stock-selection
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 恢复上一次运行保存的 SQLite 数据库
+      - name: Restore SQLite database
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: ${{ runner.os }}-sequoia-db-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-sequoia-db-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Create data directory
+        run: mkdir -p data
+
+      # 首次执行：回填全部历史数据
+      - name: Initial historical backfill
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}
+        run: python main.py --backfill
+
+      # 日常执行：增量更新 + 选股 + Telegram 推送
+      - name: Daily stock selection
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') }}
+        run: python main.py
+
+      # 运行失败时通知 Telegram
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -fsS -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=⚠️ Sequoia-X 执行失败，请检查 GitHub Actions 日志：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
