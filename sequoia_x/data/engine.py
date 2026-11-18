@@ -155,7 +155,179 @@ class DataEngine:
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
         return count
 
-    def backfill(self, symbols: list[str]) -> None:
+    
+def backfill(self, symbols: list[str]) -> None:
+    """稳定版历史回填：连接重建、失败熔断、进度记录、断点续传。"""
+    import time
+    from datetime import date, timedelta
+    import baostock as bs
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    max_retries = 3
+    reconnect_interval = 100
+    max_consecutive_failures = 20
+
+    success = 0
+    skipped = 0
+    failed = 0
+    consecutive_failures = 0
+    since_reconnect = 0
+
+    def login():
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+        time.sleep(2)
+        try:
+            result = bs.login()
+            if result.error_code != "0":
+                logger.error(f"baostock 登录失败: {result.error_msg}")
+                return False
+            logger.info("baostock 登录成功")
+            return True
+        except Exception as exc:
+            logger.error(f"baostock 连接异常: {exc}")
+            return False
+
+    if not login():
+        raise RuntimeError("baostock 初始登录失败，停止回填")
+
+    try:
+        for i, symbol in enumerate(symbols):
+            last_date = self._get_last_date(symbol)
+
+            if last_date and last_date >= today_str:
+                skipped += 1
+                continue
+
+            if since_reconnect >= reconnect_interval:
+                if not login():
+                    raise RuntimeError("定期重连失败，停止回填")
+                since_reconnect = 0
+
+            start = last_date or self.start_date
+            if last_date:
+                start = (
+                    date.fromisoformat(last_date) + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+
+            bs_code = self._to_baostock_code(symbol)
+            rows = []
+            query_ok = False
+            last_error = ""
+
+            for attempt in range(max_retries):
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start,
+                        end_date=today_str,
+                        frequency="d",
+                        adjustflag="1",
+                    )
+
+                    if rs.error_code != "0":
+                        raise RuntimeError(rs.error_msg)
+
+                    rows = []
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+
+                    query_ok = True
+                    break
+
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.warning(
+                        f"[{symbol}] 第 {attempt + 1} 次失败: {exc}"
+                    )
+
+                    if attempt < max_retries - 1:
+                        wait = 3 * (2 ** attempt)
+                        logger.info(f"{wait} 秒后重新连接")
+                        time.sleep(wait)
+
+                        if not login():
+                            logger.error("重新登录失败")
+                            continue
+
+            since_reconnect += 1
+
+            if not query_ok:
+                failed += 1
+                consecutive_failures += 1
+
+                logger.error(
+                    f"[{symbol}] 最终失败，连续失败 "
+                    f"{consecutive_failures} 只：{last_error}"
+                )
+
+                if consecutive_failures >= max_consecutive_failures:
+                    raise RuntimeError(
+                        "连续 20 只股票查询失败，疑似行情服务连接异常，停止回填"
+                    )
+                continue
+
+            consecutive_failures = 0
+
+            if not rows:
+                skipped += 1
+                continue
+
+            df = pd.DataFrame(rows, columns=rs.fields)
+
+            for col in ["open", "high", "low", "close", "volume", "amount"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna(subset=["close"])
+            df = df[df["volume"] > 0]
+
+            if df.empty:
+                skipped += 1
+                continue
+
+            df["symbol"] = symbol
+            df = df.rename(columns={"amount": "turnover"})
+            df = df[
+                ["symbol", "date", "open", "high", "low",
+                 "close", "volume", "turnover"]
+            ]
+
+            with sqlite3.connect(self.db_path) as conn:
+                df.to_sql(
+                    "stock_daily",
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=500,
+                )
+
+            success += 1
+
+            if (i + 1) % 25 == 0:
+                logger.info(
+                    f"进度 {i + 1}/{len(symbols)} | "
+                    f"成功 {success} | 跳过 {skipped} | 失败 {failed}"
+                )
+
+            # 降低连续请求频率
+            time.sleep(0.2)
+
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    logger.info(
+        f"回填完成 | 成功 {success} | "
+        f"跳过 {skipped} | 失败 {failed}"
+    )
+
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
 
         容错机制：
