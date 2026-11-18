@@ -274,7 +274,9 @@ class DataEngine:
         pending = [s for s in symbols if s not in completed]
         total = len(symbols)
 
-        logger.info(f"历史回填状态 | 总数 {total} | 已完成 {len(completed)} | 待处理 {len(pending)}")
+        logger.info(
+            f"历史回填状态 | 总数 {total} | 已完成 {len(completed)} | 待处理 {len(pending)}"
+        )
         if not pending:
             logger.info("全部股票历史回填已经完成！")
             return
@@ -282,7 +284,11 @@ class DataEngine:
         batch = pending[:batch_size]
         logger.info(f"本次回填批次：{len(batch)} 只")
 
-        success = skipped = failed = consecutive_failures = since_reconnect = 0
+        success = 0
+        skipped = 0
+        failed = 0
+        consecutive_failures = 0
+        since_reconnect = 0
 
         def login() -> bool:
             try:
@@ -307,9 +313,6 @@ class DataEngine:
         try:
             for i, symbol in enumerate(batch, start=1):
                 if since_reconnect >= reconnect_interval:
+                    logger.info("达到定期重连间隔，重新连接 baostock")
                     if not login():
                         raise RuntimeError("baostock 定期重连失败")
-                    since_reconnect = 0
-
-                bs_code = self._to_baostock_code(symbol)
-                rows = []
