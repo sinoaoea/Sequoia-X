@@ -328,13 +328,7 @@ def backfill(self, symbols: list[str]) -> None:
         f"跳过 {skipped} | 失败 {failed}"
     )
 
-        """通过 baostock 批量回填历史日 K 线数据（后复权）。
-
-        容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
-        - 已入库的自动 skip，中断后可重跑续传
-        """
+     
         import time
         from datetime import date, timedelta
 
