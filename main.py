@@ -33,9 +33,17 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+        help="分批回填历史行情数据",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=250,
+        help="每次回填股票数量，默认 250",
     )
     args = parser.parse_args()
+
+
 
     try:
         # 1. 初始化配置
@@ -52,7 +60,8 @@ def main() -> None:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
             all_symbols = engine.get_all_symbols()
-            engine.backfill(all_symbols)
+            engine.backfill(all_symbols, batch_size=args.batch_size)
+
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
