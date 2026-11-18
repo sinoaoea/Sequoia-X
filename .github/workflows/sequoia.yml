@@ -1,22 +1,28 @@
-
 name: Sequoia-X Stock Selection
 
 on:
-  # 每个工作日北京时间 19:30
+  # 1. 每个工作日北京时间 16:30（UTC 11:30）执行日常选股推送
   schedule:
     - cron: "30 11 * * 1-5"
+    # 2. 初始化期间：每小时第 15 分钟自动续跑下一批历史回填（全部完成后会自动秒退，不消耗资源）
+    - cron: "15 * * * 1-5"
 
-  # 支持手动执行
+  # 3. 支持网页端手动触发与测试
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式"
+        description: "运行模式 (backfill=历史回填, daily=日常选股)"
         required: true
         default: "daily"
         type: choice
         options:
           - backfill
           - daily
+      batch_size:
+        description: "回填批次大小 (测试建议填 10，正式回填填 250)"
+        required: false
+        default: "250"
+        type: string
 
 permissions:
   contents: read
@@ -28,11 +34,16 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 55
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -45,43 +56,54 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # 恢复上一次运行保存的 SQLite 数据库
-      - name: Restore SQLite database
-        uses: actions/cache@v4
-        with:
-          path: data/
-          key: ${{ runner.os }}-sequoia-db-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-sequoia-db-
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install .
-          
+
       - name: Check Python syntax
         run: |
           python -m compileall -q sequoia_x
           python -c "from sequoia_x.data.engine import DataEngine; print('DataEngine import OK')"
-          
-      - name: Create data directory
-        run: mkdir -p data
 
-      # 首次执行：回填全部历史数据
-      - name: Initial historical backfill
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}
-        run: python main.py --backfill
+      - name: Download SQLite DB from R2
+        run: |
+          mkdir -p data
+          if aws s3 ls "s3://${R2_BUCKET}/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}" > /dev/null 2>&1; then
+            echo "发现 R2 历史数据库，正在下载..."
+            aws s3 cp "s3://${R2_BUCKET}/sequoia_v2.db" "data/sequoia.db" --endpoint-url "${R2_ENDPOINT}"
+            ls -lh data/sequoia.db
+          else
+            echo "R2 中暂无历史数据库，将在本次运行中全新创建。"
+          fi
 
-      # 日常执行：增量更新 + 选股 + Telegram 推送
+      # 历史回填：手动选 backfill 或 每小时自动续跑定时触发
+      - name: Historical backfill
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill') || (github.event_name == 'schedule' && github.event.schedule == '15 * * * 1-5') }}
+        run: |
+          BATCH="${{ inputs.batch_size || '250' }}"
+          python main.py --backfill --batch-size "${BATCH}"
+
+      # 日常选股：手动选 daily 或 每个工作日 19:30 定时触发
       - name: Daily stock selection
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') || (github.event_name == 'schedule' && github.event.schedule == '30 11 * * 1-5') }}
         run: python main.py
 
-      # 运行失败时通知 Telegram
+      - name: Upload SQLite DB to R2
+        if: success()
+        run: |
+          if [ -f "data/sequoia.db" ]; then
+            python -c "import sqlite3; conn = sqlite3.connect('data/sequoia.db'); conn.execute('PRAGMA wal_checkpoint(TRUNCATE);'); conn.close(); print('SQLite checkpoint completed')"
+            aws s3 cp "data/sequoia.db" "s3://${R2_BUCKET}/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}"
+            echo "最新数据库已安全上传至 Cloudflare R2！"
+          else
+            echo "未找到 data/sequoia.db，跳过上传。"
+          fi
+
       - name: Notify failure
         if: failure()
         run: |
           curl -fsS -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=⚠️ Sequoia-X 执行失败，请检查 GitHub Actions 日志：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
