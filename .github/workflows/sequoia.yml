@@ -1,10 +1,10 @@
 name: Sequoia-X Stock Selection
 
 on:
-  # 1. 每个工作日北京时间 16:30（UTC 11:30）执行日常选股推送
+  # 1. 每个工作日定时触发日常选股推送（UTC 11:30 = 北京时间 19:30）
   schedule:
     - cron: "30 11 * * 1-5"
-    # 2. 初始化期间：每小时第 15 分钟自动续跑下一批历史回填（全部完成后会自动秒退，不消耗资源）
+    # 2. 初始化期间：每个工作日每小时第 15 分钟自动续跑下一批历史回填
     - cron: "15 * * * 1-5"
 
   # 3. 支持网页端手动触发与测试
@@ -71,8 +71,8 @@ jobs:
           mkdir -p data
           if aws s3 ls "s3://${R2_BUCKET}/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}" > /dev/null 2>&1; then
             echo "发现 R2 历史数据库，正在下载..."
-            aws s3 cp "s3://${R2_BUCKET}/sequoia_v2.db" "data/sequoia.db" --endpoint-url "${R2_ENDPOINT}"
-            ls -lh data/sequoia.db
+            aws s3 cp "s3://${R2_BUCKET}/sequoia_v2.db" "data/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}"
+            ls -lh data/sequoia_v2.db
           else
             echo "R2 中暂无历史数据库，将在本次运行中全新创建。"
           fi
@@ -84,7 +84,7 @@ jobs:
           BATCH="${{ inputs.batch_size || '250' }}"
           python main.py --backfill --batch-size "${BATCH}"
 
-      # 日常选股：手动选 daily 或 每个工作日 19:30 定时触发
+      # 日常选股：手动选 daily 或 每个工作日定时触发
       - name: Daily stock selection
         if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') || (github.event_name == 'schedule' && github.event.schedule == '30 11 * * 1-5') }}
         run: python main.py
@@ -92,18 +92,27 @@ jobs:
       - name: Upload SQLite DB to R2
         if: success()
         run: |
-          if [ -f "data/sequoia.db" ]; then
-            python -c "import sqlite3; conn = sqlite3.connect('data/sequoia.db'); conn.execute('PRAGMA wal_checkpoint(TRUNCATE);'); conn.close(); print('SQLite checkpoint completed')"
-            aws s3 cp "data/sequoia.db" "s3://${R2_BUCKET}/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}"
-            echo "最新数据库已安全上传至 Cloudflare R2！"
+          DB_FILE="data/sequoia_v2.db"
+          if [ ! -f "$DB_FILE" ] && [ -f "data/sequoia.db" ]; then
+            DB_FILE="data/sequoia.db"
+          fi
+
+          if [ -f "$DB_FILE" ]; then
+            ls -lh "$DB_FILE"
+            python -c "import sqlite3; conn = sqlite3.connect('${DB_FILE}'); conn.execute('PRAGMA wal_checkpoint(TRUNCATE);'); conn.close(); print('SQLite checkpoint completed')"
+            aws s3 cp "$DB_FILE" "s3://${R2_BUCKET}/sequoia_v2.db" --endpoint-url "${R2_ENDPOINT}"
+            echo "最新数据库 ($DB_FILE) 已安全上传至 Cloudflare R2！"
           else
-            echo "未找到 data/sequoia.db，跳过上传。"
+            echo "未找到本地 SQLite 数据库文件，跳过上传。"
           fi
 
       - name: Notify failure
         if: failure()
         run: |
-          curl -fsS -X POST \
-            "https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=⚠️ Sequoia-X 执行失败，请检查 GitHub Actions 日志：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+            curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=⚠️ Sequoia-X 执行失败，请检查 GitHub Actions 日志：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          else
+            echo "未配置 Telegram Secrets，跳过失败通知。"
+          fi
