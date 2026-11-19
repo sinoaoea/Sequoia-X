@@ -1,4 +1,3 @@
-
 """Telegram 通知模块：发送 Sequoia-X 选股结果。"""
 
 import os
@@ -9,9 +8,10 @@ from datetime import date
 class TelegramNotifier:
     def __init__(self, settings=None):
         self.token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        raw_chat_ids = os.getenv("TELEGRAM_CHAT_ID", "")
+        self.chat_ids = [cid.strip() for cid in raw_chat_ids.split(",") if cid.strip()]
 
-        if not self.token or not self.chat_id:
+        if not self.token or not self.chat_ids:
             raise ValueError("缺少 Telegram Bot Token 或 Chat ID")
 
     def send(
@@ -51,17 +51,18 @@ class TelegramNotifier:
 
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
-        for chunk in chunks:
-            response = requests.post(
-                url,
-                json={
-                    "chat_id": self.chat_id,
-                    "text": chunk,
-                },
-                timeout=20,
-            )
-            response.raise_for_status()
+        for chat_id in self.chat_ids:
+            for chunk in chunks:
+                response = requests.post(
+                    url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": chunk,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
 
-            result = response.json()
-            if not result.get("ok"):
-                raise RuntimeError(f"Telegram 推送失败：{result}")
+                result = response.json()
+                if not result.get("ok"):
+                    raise RuntimeError(f"Telegram 推送失败（chat_id={chat_id}）：{result}")
