@@ -1,23 +1,21 @@
 name: Sequoia-X Stock Selection
 
 on:
-  # 1. 每个工作日定时触发日常选股推送（UTC 11:30 = 北京时间 19:30）
+  # 每个工作日定时触发日常选股推送（UTC 11:30 = 北京时间 19:30）
   schedule:
     - cron: "30 11 * * 1-5"
-    # 2. 初始化期间：每个工作日每小时第 15 分钟自动续跑下一批历史回填
-    - cron: "15 * * * 1-5"
 
-  # 3. 支持网页端手动触发与测试
+  # 支持网页端手动触发与测试
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式 (backfill=历史回填, daily=日常选股)"
+        description: "运行模式 (daily=日常选股, backfill=历史回填)"
         required: true
         default: "daily"
         type: choice
         options:
-          - backfill
           - daily
+          - backfill
       batch_size:
         description: "回填批次大小 (测试建议填 10，正式回填填 250)"
         required: false
@@ -28,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'schedule' && github.event.schedule == '15 * * * 1-5' && 'sequoia-backfill' || 'sequoia-daily' }}
+  group: sequoia-stock-selection
   cancel-in-progress: false
 
 jobs:
@@ -77,16 +75,16 @@ jobs:
             echo "R2 中暂无历史数据库，将在本次运行中全新创建。"
           fi
 
-      # 历史回填：手动选 backfill 或 每小时自动续跑定时触发
+      # 仅在手动选择 backfill 时执行历史回填
       - name: Historical backfill
-        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill') || (github.event_name == 'schedule' && github.event.schedule == '15 * * * 1-5') }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'backfill' }}
         run: |
           BATCH="${{ inputs.batch_size || '250' }}"
           python main.py --backfill --batch-size "${BATCH}"
 
       # 日常选股：手动选 daily 或 每个工作日定时触发
       - name: Daily stock selection
-        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') || (github.event_name == 'schedule' && github.event.schedule == '30 11 * * 1-5') }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily') || github.event_name == 'schedule' }}
         run: python main.py
 
       - name: Upload SQLite DB to R2
